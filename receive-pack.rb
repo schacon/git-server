@@ -28,7 +28,25 @@ class GitServer
     puts "REC PACK: #{path}"
     send_refs
     packet_flush
-    puts read_until_null
+    read_refs
+    read_pack
+  end
+
+  def read_refs
+    while( line = read_until_null ) do
+      puts line
+      puts line.size
+    end
+    puts line = read_until_null(true)
+    puts line.size
+    puts '--'
+  end
+  
+  def read_pack
+    puts @session.recv(1000)
+    puts @session.recv(1000)
+    puts @session.recv(1000)
+    puts @session.recv(1000)
   end
   
   def packet_flush
@@ -78,10 +96,10 @@ class GitServer
 		[len, command, directory, stuff]
 	end
 	
-	def read_until_null
+	def read_until_null(debug = false)
 	  data = ''
 	  while c = @session.recv(1)
-	    #puts "read: #{c}:#{c[0]}"
+	    puts "read: #{c}:#{c[0]}" if debug
 	    if c[0] == 0
 	      return data
 	    else
@@ -100,6 +118,7 @@ class GitServer
     server = TCPServer.new('127.0.0.1', 9418)
     while (@session = server.accept)
       do_action
+      return
     end
   end
   
