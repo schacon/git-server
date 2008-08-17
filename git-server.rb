@@ -4,6 +4,7 @@ require 'pp'
 require 'zlib'
 require 'fileutils'
 require 'digest'
+require 'objects'
 
 class GitServer
 
@@ -141,9 +142,11 @@ class GitServer
     end
   
     def unpack_all(entries)
+      return if !entries
       1.upto(entries) do |number|
         unpack_object(number)
-      end if entries
+      end 
+      puts 'checksum:' + @session.recv(20).unpack("H*")[0]
     end
   
     def unpack_object(number)
@@ -159,12 +162,12 @@ class GitServer
           
       case type
       when OBJ_OFS_DELTA, OBJ_REF_DELTA
-        puts "WRITE " + OBJ_TYPES[type].to_s
         sha = unpack_deltified(type, size)
+        #puts "WRITE " + OBJ_TYPES[type].to_s + sha
         return
       when OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG
-        #puts "WRITE " + OBJ_TYPES[type].to_s    
         sha = unpack_compressed(type, size)
+        #puts "WRITE " + OBJ_TYPES[type].to_s + sha   
         return
       else
         puts "invalid type #{type}"
@@ -196,8 +199,10 @@ class GitServer
       File.exists?(File.join(@git_dir, 'objects', sha1[0...2], sha1[2..39]))
     end
     
+
     def get_raw_object(sha1)
       path = File.join(@git_dir, 'objects', sha1[0...2], sha1[2..39])
+      return false if !File.exists?(path)
       buf = File.read(path)
       
       if buf.length < 2
@@ -385,6 +390,10 @@ class GitServer
     def packet_flush
       @session.send('0000', 0)
     end
+
+    def send_ack
+      @session.send("0007NAK", 0)
+    end
   
     def refs
       @refs = []
@@ -422,10 +431,113 @@ class GitServer
     end
   
     def upload_pack(path)
-      puts "UPL PACK"
+      @git_dir = File.join(@path, path)
       send_refs
-      read_refs
+      packet_flush
+      receive_needs
+      send_ack
       upload_pack_file
+    end
+    
+    def receive_needs
+      @need_refs = []
+      while(data = packet_read_line) do
+        cmd, sha = data.split(' ')
+        @need_refs << [cmd, sha]
+      end
+      puts 'done:'
+      puts @session.recv(9)
+      @need_refs
+    end
+    
+    def upload_pack_file
+      @send_objects = {}
+      @need_refs.each do |cmd, sha|
+        if cmd == 'want' && sha != NULL_SHA
+          @send_objects[sha] = ' commit'
+          build_object_list_from_commit(sha)
+        end
+      end
+      @send_objects = @send_objects.sort { |a, b| a[1] <=> b[1] }
+      pp @send_objects
+
+      build_pack_file
+    end
+    
+    def build_pack_file
+      @digest = Digest::SHA1.new
+      
+      # build_header
+      write_pack('PACK')
+      write_pack([2].pack("N"))
+      write_pack([@send_objects.length].pack("N"))
+      
+      # build_pack
+      @send_objects.each do |sha, name|
+        # build pack header
+        content, type = get_raw_object(sha)
+        size = content.length
+        btype = type_to_flag(type)
+        
+        c = (btype << 4) | (size & 15)
+        c |= 0x80
+      	size = (size >> 4)
+      	write_pack(c.chr)
+      	while (size > 0) do
+      		c = size & 0x7f
+        	size = (size >> 7)
+        	if size > 0
+      	    c |= 0x80;
+      	  end
+        	write_pack(c.chr)
+      	end
+      	
+        # pack object data
+        write_pack(Zlib::Deflate.deflate(content))
+      end
+      
+      @session.send([@digest.hexdigest].pack("H*"), 0)
+    end
+    
+    def type_to_flag(type)
+      case type.to_s
+      when 'commit': return OBJ_COMMIT
+      when 'tree': return OBJ_TREE
+      when 'blob': return OBJ_BLOB
+      when 'tag': return OBJ_TAG
+      end
+    end
+    
+    def write_pack(bits)
+      @session.send(bits, 0)
+      @digest << bits
+    end
+    
+    def object_from_sha(sha)
+      content, type = get_raw_object(sha)
+      Git::Object.from_raw(Git::RawObject.new(type.to_sym, content))
+    end
+    
+    def build_object_list_from_commit(sha)
+      # go through each parent sha
+      commit = object_from_sha(sha)
+      # traverse the tree and add all the tree/blob shas 
+      @send_objects[commit.tree] = '/'
+      build_object_list_from_tree(commit.tree)
+      commit.parent.each do |p|
+        @send_objects[p] = ' commit'
+        build_object_list_from_commit(p)
+      end
+    end
+    
+    def build_object_list_from_tree(sha)
+      tree = object_from_sha(sha)
+      tree.entry.each do |t|
+        @send_objects[t.sha1] = t.name
+        if t.type == :tree
+          build_object_list_from_tree(t.sha1)
+        end
+      end
     end
     
     def read_header()
