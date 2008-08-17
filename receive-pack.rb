@@ -2,13 +2,16 @@
 require 'socket'
 require 'pp'
 require 'zlib'
+require 'fileutils'
+require 'digest'
 
 class GitServer
 
   NULL_SHA = '0000000000000000000000000000000000000000'
   #CAPABILITIES = " report-status delete-refs "
+  #CAPABILITIES = " multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-progress "
   CAPABILITIES = " "
-
+  
   OBJ_NONE = 0
   OBJ_COMMIT = 1
   OBJ_TREE = 2
@@ -19,15 +22,19 @@ class GitServer
 
   OBJ_TYPES = [nil, :commit, :tree, :blob, :tag, nil, :ofs_delta, :ref_delta].freeze
 
-  def self.start_server
-    server = self.new
+  def initialize(path)
+    @path = path
+  end
+  
+  def self.start_server(path)
+    server = self.new(path)
     server.listen
   end
 
   def listen
     server = TCPServer.new('127.0.0.1', 9418)
     while (session = server.accept)
-      t = GitServerThread.new(session)
+      t = GitServerThread.new(session, @path)
       t.do_action
       return
     end
@@ -35,7 +42,8 @@ class GitServer
 
   class GitServerThread
   
-    def initialize(session)
+    def initialize(session, path)
+      @path = path
       @session = session
       @capabilities_sent = false
     end
@@ -54,37 +62,88 @@ class GitServer
     end
   
     def receive_pack(path)
-      puts "REC PACK: #{path}"
+      @delta_list = {}
+      
+      @git_dir = File.join(@path, path)
+      git_init(@git_dir) if !File.exists?(@git_dir)
+      
       send_refs
       packet_flush
       read_refs
       read_pack
+      write_refs
+    end
+    
+    def write_refs
+      @refs.each do |sha_old, sha_new, path|
+        ref = File.join(@git_dir, path)
+        FileUtils.mkdir_p(File.dirname(ref))
+        File.open(ref, 'w+') { |f| f.write(sha_new) }
+      end
+    end
+      
+    def git_init(dir, bare = false)
+      FileUtils.mkdir_p(dir) if !File.exists?(dir)
+      
+      FileUtils.cd(dir) do
+        if(File.exists?('objects'))
+          return false # already initialized
+        else
+          # initialize directory
+          create_initial_config(bare)
+          FileUtils.mkdir_p('refs/heads')
+          FileUtils.mkdir_p('refs/tags')
+          FileUtils.mkdir_p('objects/info')
+          FileUtils.mkdir_p('objects/pack')
+          FileUtils.mkdir_p('branches')
+          add_file('description', 'Unnamed repository; edit this file to name it for gitweb.')
+          add_file('HEAD', "ref: refs/heads/master\n")
+          FileUtils.mkdir_p('hooks')
+          FileUtils.cd('hooks') do
+            add_file('applypatch-msg', '# add shell script and make executable to enable')
+            add_file('post-commit', '# add shell script and make executable to enable')
+            add_file('post-receive', '# add shell script and make executable to enable')
+            add_file('post-update', '# add shell script and make executable to enable')
+            add_file('pre-applypatch', '# add shell script and make executable to enable')
+            add_file('pre-commit', '# add shell script and make executable to enable')
+            add_file('pre-rebase', '# add shell script and make executable to enable')
+            add_file('update', '# add shell script and make executable to enable')
+          end
+          FileUtils.mkdir_p('info')
+          add_file('info/exclude', "# *.[oa]\n# *~")
+        end
+      end
+    end
+    
+    def create_initial_config(bare = false)
+      bare ? bare_status = 'true' : bare_status = 'false'
+      config = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = #{bare_status}\n\tlogallrefupdates = true"
+      add_file('config', config)
+    end
+      
+    def add_file(name, contents)
+      File.open(name, 'w') do |f|
+        f.write contents
+      end
     end
 
     def read_refs
-      headers = []
+      @refs = []
       while(data = packet_read_line) do
         sha_old, sha_new, path = data.split(' ')
-        headers << [sha_old, sha_new, path]
+        @refs << [sha_old, sha_new, path]
       end
-      pp headers
     end
   
     def read_pack
       (sig, ver, entries) = read_pack_header
-    
-      puts "SIG: #{sig}"
-      puts "VER: #{ver}"
-      puts "ENT: #{entries}"
-      puts
-    
       unpack_all(entries)
     end
   
     def unpack_all(entries)
       1.upto(entries) do |number|
         unpack_object(number)
-      end
+      end if entries
     end
   
     def unpack_object(number)
@@ -101,11 +160,11 @@ class GitServer
       case type
       when OBJ_OFS_DELTA, OBJ_REF_DELTA
         puts "WRITE " + OBJ_TYPES[type].to_s
-        unpack_deltified(type, size)
+        sha = unpack_deltified(type, size)
         return
       when OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG
-        puts "WRITE " + OBJ_TYPES[type].to_s    
-        unpack_compressed(type, size)
+        #puts "WRITE " + OBJ_TYPES[type].to_s    
+        sha = unpack_compressed(type, size)
         return
       else
         puts "invalid type #{type}"
@@ -114,12 +173,120 @@ class GitServer
 
     def unpack_compressed(type, size)
       object_data = get_data(size)
+      sha = put_raw_object(object_data, OBJ_TYPES[type].to_s)
+      check_delta(sha)
+    end
+    
+    def check_delta(sha)
+      unpack_delta_cached(sha) if @delta_list[sha]
+      sha
+    end
+    
+    def unpack_delta_cached(sha)
+      base, type = get_raw_object(sha)
+      @delta_list[sha].each do |patch|
+        obj_data = patch_delta(base, patch)
+        sha = put_raw_object(obj_data, type)
+        check_delta(sha)
+      end
+      @delta_list[sha] = nil
     end
 
+    def has_object?(sha1)
+      File.exists?(File.join(@git_dir, 'objects', sha1[0...2], sha1[2..39]))
+    end
+    
+    def get_raw_object(sha1)
+      path = File.join(@git_dir, 'objects', sha1[0...2], sha1[2..39])
+      buf = File.read(path)
+      
+      if buf.length < 2
+        puts "object file too small"
+      end
+
+      if legacy_loose_object?(buf)
+        content = Zlib::Inflate.inflate(buf)
+        header, content = content.split(/\0/, 2)
+        if !header || !content
+          puts "invalid object header"
+        end
+        type, size = header.split(/ /, 2)
+        if !%w(blob tree commit tag).include?(type) || size !~ /^\d+$/
+          puts "invalid object header"
+        end
+        type = type.to_sym
+        size = size.to_i
+      else
+        type, size, used = unpack_object_header_gently(buf)
+        content = Zlib::Inflate.inflate(buf[used..-1])
+      end
+      puts "size mismatch" if content.length != size
+      return [content, type]
+    end
+    
+    def legacy_loose_object?(buf)
+      word = (buf[0] << 8) + buf[1]
+      buf[0] == 0x78 && word % 31 == 0
+    end
+    
+    def unpack_object_header_gently(buf)
+      used = 0
+      c = buf[used]
+      used += 1
+
+      type = (c >> 4) & 7;
+      size = c & 15;
+      shift = 4;
+      while c & 0x80 != 0
+        if buf.length <= used
+          raise LooseObjectError, "object file too short"
+        end
+        c = buf[used]
+        used += 1
+
+        size += (c & 0x7f) << shift
+        shift += 7
+      end
+      type = OBJ_TYPES[type]
+      if ![:blob, :tree, :commit, :tag].include?(type)
+        raise LooseObjectError, "invalid loose object type"
+      end
+      return [type, size, used]
+    end
+    
+    def put_raw_object(content, type)
+      size = content.length.to_s
+
+      header = "#{type} #{size}\0"
+      store = header + content
+                
+      sha1 = Digest::SHA1.hexdigest(store)
+      path = File.join(@git_dir, 'objects', sha1[0...2], sha1[2..40])
+      
+      if !File.exists?(path)
+        content = Zlib::Deflate.deflate(store)
+      
+        FileUtils.mkdir_p(File.join(@git_dir, 'objects', sha1[0...2]))
+        File.open(path, 'w') do |f|
+          f.write content
+        end
+      end
+      return sha1
+    end
+        
     def unpack_deltified(type, size)
       if type == OBJ_REF_DELTA
         base_sha = @session.recv(20)
-        object_data = get_data(size)
+        sha1 = base_sha.unpack("H*")[0]
+        delta = get_data(size)
+        if has_object?(sha1)
+          base, type = get_raw_object(sha1)
+          obj_data = patch_delta(base, delta)
+          return put_raw_object(obj_data, type)
+        else
+          @delta_list[sha1] ||= []
+          @delta_list[sha1] << delta
+        end
       else
         i = 0
         c = data[i]
@@ -131,12 +298,9 @@ class GitServer
           base_offset |= c & 0x7f
         end
         offset += i + 1
+        return false  ## NOT SUPPORTED YET ##
       end
-      
-      return false
-      
-      base, type = unpack_object(packfile, base_offset)    
-      [patch_delta(base, delta), type]
+      return nil
     end
   
     def get_data(size)
@@ -223,12 +387,17 @@ class GitServer
     end
   
     def refs
-      []
+      @refs = []
+      Dir.chdir(@git_dir) do
+        Dir.glob("refs/**/*") do |file|
+          @refs << [File.read(file), file] if File.file?(file)
+        end
+      end
+      @refs
     end
   
     def send_refs
       refs.each do |ref|
-        puts ref
         send_ref(ref[1], ref[0])
       end
       send_ref("capabilities^{}", NULL_SHA) if !@capabiliies_sent
@@ -254,8 +423,11 @@ class GitServer
   
     def upload_pack(path)
       puts "UPL PACK"
+      send_refs
+      read_refs
+      upload_pack_file
     end
-  
+    
     def read_header()
       len = @session.recv( 4 ).hex
   		return false if (len == 0)
@@ -268,7 +440,7 @@ class GitServer
   	def read_until_null(debug = false)
   	  data = ''
   	  while c = @session.recv(1)
-  	    puts "read: #{c}:#{c[0]}" if debug
+  	    #puts "read: #{c}:#{c[0]}" if debug
   	    if c[0] == 0
   	      return data
   	    else
@@ -282,5 +454,6 @@ class GitServer
   end
 end
 
-GitServer.start_server
+#FileUtils.rm_r('/tmp/gittest') rescue nil
+GitServer.start_server('/tmp/gittest')
 
